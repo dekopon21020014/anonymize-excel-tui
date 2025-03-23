@@ -1,0 +1,10 @@
+[Unit]
+Description=Automount CD-ROM
+Requires=media-cdrom.mount
+
+[Automount]
+Where=/media/cdrom
+
+[Install]
+WantedBy=multi-user.target
+

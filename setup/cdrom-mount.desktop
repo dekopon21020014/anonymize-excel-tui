@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CD/DVDを読み込む
+Exec=gnome-terminal -- bash -c "sudo systemctl start media-cdrom.automount"
+Icon=utilities-terminal
+Terminal=false

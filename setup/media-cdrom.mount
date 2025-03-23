@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount CD-ROM
+Requires=systemd-udevd.service
+After=systemd-udevd.service
+
+[Mount]
+What=/dev/cdrom
+Where=/media/cdrom
+Type=iso9660
+Options=ro,user,auto,nofail
+
+[Install]
+WantedBy=multi-user.target
