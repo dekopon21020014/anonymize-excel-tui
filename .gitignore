@@ -1,0 +1,6 @@
+/tmp
+*.tar
+*.sqlite
+.env
+.env.prod
+.DS_Store
