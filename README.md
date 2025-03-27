@@ -1,4 +1,4 @@
-# Anonymize-Exel-TUI
+# Anonymize-Excel-TUI
 
 ## 概要
 `Anonymize-Excel-TUI` は、医療データの匿名化を支援するTUI（Text-based User Interface）アプリケーションです。
@@ -26,7 +26,7 @@ sh build.prod.sh
 # USBメモリをPCに挿す
 cd /media/user-name/usb-name/setup
 sh install.sh
-cp anonymize-mfer.desktop ~/Desktop/
+#cp anonymize-excel.desktop ~/Desktop/
 # デスクトップのアイコンを右クリックして"Allow launching"をクリック
 ```
 
