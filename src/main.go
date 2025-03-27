@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -47,29 +48,143 @@ func (xf *ExcelFile) anonymize() {
 
 	for _, sheetName := range sheets {
 		// 行を取得
-		rows, err := xf.GetRows(sheetName)
+		rows, err := xf.Rows(sheetName)
 		if err != nil {
 			log.Println("Error reading rows from sheet:", sheetName, err)
 			continue
 		}
+		defer rows.Close() // メモリ解放
 
-		// ハッシュ化してB列を置換
-		for i, row := range rows {
-			if len(row) < 2 {
-				continue // B列が存在しない場合はスキップ
+		i := 0
+		for rows.Next() {
+			row, err := rows.Columns()
+			if err != nil {
+				log.Println("Error reading row:", err)
+				continue
 			}
+
+			if len(row) < 2 {
+				i++
+				continue
+			}
+
 			patientID := row[1]
 			hashedID := sha256Hash(patientID, password)
-			xf.SetCellValue(sheetName, fmt.Sprintf("B%d", i+1), hashedID)           // B列を置換
-			xf.SetCellValue(sheetName, fmt.Sprintf("C%d", i+1), "")                 // C列を削除
-			xf.SetCellValue(sheetName, fmt.Sprintf("D%d", i+1), "")                 // D列を削除
-			xf.SetCellValue(sheetName, fmt.Sprintf("D%d", i+1), "")                 // D列を削除
-			xf.SetCellValue(sheetName, fmt.Sprintf("F%d", i+1), formatDate(row[5])) // 生年月日から日を消す
-			xf.SetCellValue(sheetName, fmt.Sprintf("J%d", i+1), "")                 // 保険記号
-			xf.SetCellValue(sheetName, fmt.Sprintf("K%d", i+1), "")                 // 保険番号
-			patientsTable.Insert(hashedID, row[:7])
+			// xf.SetCellValue(sheetName, fmt.Sprintf("B%d", i+1), hashedID)
+			rowData := []interface{}{row[0], hashedID, "", "", row[4], formatDate(row[5]), row[6]}
+			xf.SetSheetRow(sheetName, fmt.Sprintf("A%d", i+1), &rowData)
+
+			i++
 		}
 	}
+}
+
+func (xf *ExcelFile) anonymizeStreaming(outputDir string) error {
+	// すべてのシートを取得
+	sheets := xf.GetSheetList()
+	if len(sheets) == 0 {
+		return fmt.Errorf("no sheets found in the Excel file")
+	}
+
+	for _, sheetName := range sheets {
+		// 出力用のExcelファイルを新規作成
+		newFile := excelize.NewFile()
+		newSheetIndex, err := newFile.NewSheet(sheetName) // シートを作成anonymizeStreaming
+		if err != nil {                                   // シート作成失敗
+			log.Println("Error creating new sheet:", err)
+			continue
+		}
+		newFile.SetActiveSheet(newSheetIndex) // 作成したシートをアクティブにする
+
+		// 行を取得（ストリーミング）
+		rows, err := xf.Rows(sheetName)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		// バッファサイズ設定
+		bufferSize := 1000
+		rowCount := 0
+		var processedRows [][]string
+
+		for rows.Next() {
+			row, err := rows.Columns()
+			if err != nil {
+				return err
+			}
+
+			if len(row) < 2 {
+				processedRows = append(processedRows, row)
+				rowCount++
+				continue
+			}
+
+			patientID := row[1]
+			hashedID := sha256Hash(patientID, password)
+			// 行を加工
+			var additionalCols []string
+			for _, col := range row[6:] {
+				additionalCols = append(additionalCols, fmt.Sprintf("%v", col)) // 文字列に変換
+			}
+			processedRow := append([]string{row[0], hashedID, "", "", row[4], formatDate(row[5])}, additionalCols...)
+			processedRows = append(processedRows, processedRow)
+			rowCount++
+
+			// バッファがいっぱいになったら書き戻す
+			if rowCount%bufferSize == 0 {
+				if err := writeBuffer(newFile, sheetName, processedRows); err != nil {
+					return err
+				}
+				processedRows = nil // メモリ開放
+			}
+		}
+
+		// 残りの行を書き戻す
+		if len(processedRows) > 0 {
+			if err := writeBuffer(newFile, sheetName, processedRows); err != nil {
+				return err
+			}
+		}
+
+		// シート名を元にファイルを保存
+		outputPath := filepath.Join(outputDir, fmt.Sprintf("%s.xlsx", sanitizeFileName(sheetName)))
+		// **出力先ディレクトリを作成**
+		if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
+		// **ファイルを保存**
+		if err := newFile.SaveAs(outputPath); err != nil {
+			return err
+		}
+
+		log.Printf("Processed sheet %s: %d rows -> Saved to %s", sheetName, rowCount, outputPath)
+	}
+	return nil
+}
+
+// **バッファのデータを書き戻す関数**
+func writeBuffer(xf *excelize.File, sheetName string, processedRows [][]string) error {
+	for i, processedRow := range processedRows {
+		for j, val := range processedRow {
+			colLetter := string(rune('A' + (j % 26))) // A~Z でループするように
+			if j >= 26 {
+				colLetter = fmt.Sprintf("%c%c", 'A'+(j/26)-1, 'A'+(j%26)) // 2桁カラム対応
+			}
+			cellRef := fmt.Sprintf("%s%d", colLetter, i+1)
+			if err := xf.SetCellValue(sheetName, cellRef, val); err != nil {
+				log.Printf("犯人は毛利小五郎")
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// **ファイル名に使えない文字を置換**
+func sanitizeFileName(name string) string {
+	re := regexp.MustCompile(`[<>:"/\\|?*]`)
+	return re.ReplaceAllString(name, "_")
 }
 
 func formatDate(dateStr string) string {
@@ -149,13 +264,18 @@ func initializeTUI() {
 
 // ** パスワード入力フォーム **
 func createPasswordForm() *tview.Form {
-	form := tview.NewForm().
-		AddPasswordField("パスワード:", "", 20, '*', func(text string) {
+	form := tview.NewForm()
+	if password == "" { // 初回のみパスワード入力を要求
+		form.AddPasswordField("パスワード:", "", 20, '*', func(text string) {
 			password = text
-		}).
-		AddButton("次へ", func() {
-			updateExcelList()
-		}).
+		})
+	} else {
+		form.AddTextView("パスワード:", "(前回のパスワードを使用)", 40, 1, false, false)
+	}
+
+	form.AddButton("次へ", func() {
+		updateExcelList()
+	}).
 		AddButton("終了", func() {
 			app.Stop()
 			os.Exit(0)
@@ -218,6 +338,7 @@ func updateExcelList() {
 }
 
 func anonymizeExcel(selectedExcel string) {
+	log.Println("ここで実行されてます:", selectedExcel)
 	// Excelファイルを開く
 	xlFile, err := excelize.OpenFile(selectedExcel)
 	if err != nil {
@@ -226,7 +347,12 @@ func anonymizeExcel(selectedExcel string) {
 	}
 
 	excel := &ExcelFile{xlFile}
-	excel.anonymize()
+	err = excel.anonymizeStreaming(saveDir)
+	if err != nil {
+		log.Println("Error Stringming:", err)
+		return
+	}
+	log.Println("=========================:", saveDir)
 
 	// 保存フォルダが存在しない場合は作成
 	if _, err := os.Stat(saveDir); os.IsNotExist(err) {
@@ -236,12 +362,12 @@ func anonymizeExcel(selectedExcel string) {
 		}
 	}
 
-	// 保存
-	outputPath := filepath.Join(saveDir, "anonymizedData.xlsx")
-	if err := excel.SaveAs(outputPath); err != nil {
-		log.Println("Error saving file:", err)
-		return
-	}
+	// // 保存
+	// outputPath := filepath.Join(saveDir, "anonymizedData.xlsx")
+	// if err := excel.SaveAs(outputPath); err != nil {
+	// 	log.Println("Error saving file:", err)
+	// 	return
+	// }
 
 	log.Println("Anonymized file saved to:", saveDir)
 	showCompletionMenu()
@@ -268,6 +394,7 @@ func showCompletionMenu() {
 				os.Exit(0)
 			} else {
 				app.Stop()
+				return
 			}
 		})
 
