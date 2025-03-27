@@ -1,0 +1,345 @@
+package main
+
+import (
+	"anonymize-excel-tui/table"
+	"encoding/csv"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/rivo/tview"
+	"github.com/xuri/excelize/v2"
+)
+
+var (
+	wg            sync.WaitGroup
+	app           *tview.Application
+	layout        *tview.Flex
+	password      string
+	saveDir       string
+	currentDir    string
+	selectedExel  string
+	patientsTable *table.PatientsTable
+
+	// 各種UI
+	passwordForm *tview.Form
+	excelList    *tview.List
+	logView      *tview.TextView
+)
+
+type ExcelFile struct {
+	*excelize.File
+}
+
+// ExportCSV exports a specific sheet from the Excel file to a CSV file
+// Parameters:
+// - sheetName: Name of the sheet to export
+// - outputPath: Path where the CSV file will be saved (can be a directory or full file path)
+// - options: Optional parameters to customize CSV export
+func (e *ExcelFile) ExportCSV(sheetName, outputPath string, options ...ExportOption) error {
+	// Default export options
+	config := &exportConfig{
+		includeHeader: true,
+		startRow:      1,
+	}
+
+	// Apply any custom options
+	for _, opt := range options {
+		opt(config)
+	}
+
+	// Validate sheet name
+	rows, err := e.GetRows(sheetName)
+	if err != nil {
+		return fmt.Errorf("failed to get rows from sheet %s: %v", sheetName, err)
+	}
+
+	// Determine output file path
+	outputFile := e.determineOutputPath(outputPath, sheetName)
+
+	// Create the output file
+	file, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file: %v", err)
+	}
+	defer file.Close()
+
+	// Create CSV writer
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Slice rows based on start row configuration
+	if config.startRow > 1 && config.startRow <= len(rows) {
+		rows = rows[config.startRow-1:]
+	}
+
+	// Handle header option
+	if !config.includeHeader && len(rows) > 0 {
+		rows = rows[1:]
+	}
+
+	// Write rows to CSV
+	for _, row := range rows {
+		if err := writer.Write(row); err != nil {
+			return fmt.Errorf("error writing row to CSV: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// Helper function to determine output file path
+func (e *ExcelFile) determineOutputPath(outputPath, sheetName string) string {
+	// If outputPath is a directory, generate filename
+	if info, err := os.Stat(outputPath); err == nil && info.IsDir() {
+		filename := fmt.Sprintf("%s_%s.csv",
+			filepath.Base(e.Path),
+			sheetName)
+		return filepath.Join(outputPath, filename)
+	}
+
+	// If outputPath doesn't end with .csv, append it
+	if filepath.Ext(outputPath) != ".csv" {
+		outputPath += ".csv"
+	}
+
+	return outputPath
+}
+
+// Export configuration options
+type exportConfig struct {
+	includeHeader bool
+	startRow      int
+}
+
+// ExportOption allows customizing CSV export
+type ExportOption func(*exportConfig)
+
+// WithoutHeader option to exclude header row
+func WithoutHeader() ExportOption {
+	return func(ec *exportConfig) {
+		ec.includeHeader = false
+	}
+}
+
+// StartFromRow option to specify starting row
+func StartFromRow(rowNum int) ExportOption {
+	return func(ec *exportConfig) {
+		ec.startRow = rowNum
+	}
+}
+
+// ** メイン関数 **
+func main() {
+	// .envファイルを読み込む
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatalf("Error loading .env file")
+	}
+
+	patientsTable = table.SetupDatabase()
+	defer patientsTable.DB.Close()
+
+	setupLogger()
+
+	for { // ユーザが"終了"を選択するまでループ
+		saveDir = filepath.Join(os.Getenv("ANNONYMIZED_DATA_DIR"), time.Now().Format("2006-01-02-150405"))
+
+		initializeTUI()
+		wg = sync.WaitGroup{}
+		if err := app.Run(); err != nil {
+			log.Fatalf("failed to start app: %v", err)
+		}
+		wg.Wait()
+	}
+}
+
+// ** ログ設定 **
+func setupLogger() {
+	// 保存フォルダが存在しない場合は作成
+	logFileDir := os.Getenv("LOG_FILE_DIR")
+	if _, err := os.Stat(logFileDir); os.IsNotExist(err) {
+		err := os.MkdirAll(logFileDir, 0755) // フォルダ作成
+		if err != nil {
+			log.Fatalf("保存フォルダの作成に失敗: %v", err)
+		}
+	}
+
+	logFile, err := os.OpenFile(
+		filepath.Join(logFileDir, os.Getenv("LOG_FILE_NAME")),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0666,
+	)
+	if err != nil {
+		log.Fatalf("ログファイル作成失敗: %v", err)
+	}
+	log.SetOutput(logFile)
+}
+
+// ** TUIの初期化 **
+func initializeTUI() {
+	app = tview.NewApplication()
+	// currentDir, _ = os.Getwd()
+	currentDir = os.Getenv("CURRENT_DIR")
+
+	// 各画面を作成
+	passwordForm = createPasswordForm()
+	excelList = createExelList()
+	logView = createLogView()
+
+	// **最初はパスワード画面を表示**
+	layout = tview.NewFlex().
+		AddItem(passwordForm, 0, 1, true).
+		AddItem(excelList, 0, 1, false)
+
+	app.SetRoot(layout, true)
+}
+
+// ** パスワード入力フォーム **
+func createPasswordForm() *tview.Form {
+	form := tview.NewForm()
+	if password == "" { // 初回のみパスワード入力を要求
+		form.AddPasswordField("パスワード:", "", 20, '*', func(text string) {
+			password = text
+		})
+	} else {
+		form.AddTextView("パスワード:", "(前回のパスワードを使用)", 40, 1, false, false)
+	}
+
+	form.AddButton("次へ", func() {
+		updateExcelList()
+	}).
+		AddButton("終了", func() {
+			app.Stop()
+			os.Exit(0)
+		})
+
+	form.SetBorder(true).SetTitle("1. パスワード入力")
+	return form
+}
+
+func createExelList() *tview.List {
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle("2. 健診データ(.xlsx)を選択")
+	return list
+}
+
+// ** ログ画面 **
+func createLogView() *tview.TextView {
+	logView := tview.NewTextView().SetDynamicColors(true)
+	logView.SetBorder(true).SetTitle("ログ")
+	return logView
+}
+
+// ** exel選択リストを更新 **
+func updateExcelList() {
+	go func() { // 非同期で処理
+		excelList.Clear()
+
+		entries, err := os.ReadDir(currentDir)
+		if err != nil {
+			logView.SetText("ディレクトリ読み取り失敗: " + err.Error())
+			return
+		}
+		for _, entry := range entries {
+			filePath := filepath.Join(currentDir, entry.Name())
+
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				excelList.AddItem("[DIR] "+entry.Name(), "", 0, func() {
+					currentDir = filePath
+					updateExcelList()
+				})
+			} else if strings.HasSuffix(strings.ToLower(entry.Name()), ".xlsx") {
+				excelList.AddItem(entry.Name(), "", 0, func() {
+					selectedExel = filePath
+					anonymizeExcel(selectedExel)
+				})
+			}
+		}
+
+		// 親ディレクトリ (..) を追加
+		parentDir := filepath.Dir(currentDir)
+		excelList.AddItem("[DIR] 前のフォルダに戻る", "", 0, func() {
+			currentDir = parentDir
+			updateExcelList()
+		})
+
+		// **[追加] 画面を更新 & フォーカス移動**
+		app.SetFocus(excelList)
+		app.Draw()
+	}()
+}
+
+func anonymizeExcel(selectedExcel string) {
+	// Excelファイルを開く
+	xlFile, err := excelize.OpenFile(selectedExcel)
+	if err != nil {
+		log.Println("Error opening file:", err)
+		return
+	}
+
+	excel := &ExcelFile{xlFile}
+	// excel.anonymize()
+
+	sheets := excel.GetSheetList()
+	if len(sheets) == 0 {
+		log.Println("No sheets found in the Excel file.")
+		return
+	}
+
+	// 保存フォルダが存在しない場合は作成
+	if _, err := os.Stat(saveDir); os.IsNotExist(err) {
+		err := os.MkdirAll(saveDir, 0755) // フォルダ作成
+		if err != nil {
+			log.Fatalf("保存フォルダの作成に失敗: %v", err)
+		}
+	}
+
+	for _, sheetName := range sheets {
+
+		//Export entire sheet with header
+		err = excel.ExportCSV(sheetName, saveDir)
+		if err != nil {
+			log.Println("Error exporting CSV:", err)
+			return
+		}
+	}
+
+	log.Println("Export csv saved to:", saveDir)
+	showCompletionMenu()
+}
+
+// // ** SHA256 ハッシュ関数 **
+// func sha256Hash(patientID, password string) string {
+// 	hash := sha256.Sum256([]byte(patientID + password))
+// 	return hex.EncodeToString(hash[:])
+// }
+
+// ** 処理完了メニュー **
+func showCompletionMenu() {
+	log.Println("complete: ", selectedExel)
+	app.Stop()
+	app = tview.NewApplication()
+
+	modal := tview.NewModal().
+		SetText(fmt.Sprintf("匿名化したファイルは %s に保存されました。\n続けますか？", saveDir)).
+		AddButtons([]string{"続ける", "終了"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			if buttonLabel == "終了" {
+				app.Stop()
+				os.Exit(0)
+			} else {
+				app.Stop()
+				return
+			}
+		})
+
+	if err := app.SetRoot(modal, true).Run(); err != nil {
+		log.Fatalf("アプリケーションエラー: %v", err)
+	}
+}
