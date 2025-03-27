@@ -2,6 +2,6 @@
 Version=1.0
 Type=Application
 Name=AnonymizeExcel
-Exec=gnome-terminal -- bash -c "docker run -it --rm -v ~:/mnt -v ~/Desktop/logs:/logs -v ~/Desktop/anonymized-data:/anonymized-data anonymize-excel:amd64"
+Exec=gnome-terminal -- bash -c "docker run -it --rm -v ~:/mnt -v ~/デスクトップ/logs:/logs -v ~/デスクトップ/anonymized-data:/anonymized-data anonymize-excel:amd64"
 Icon=utilities-terminal
 Terminal=false
