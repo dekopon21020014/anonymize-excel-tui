@@ -4,3 +4,5 @@
 .env
 .env.prod
 .DS_Store
+/anonymized-data
+.vscode
