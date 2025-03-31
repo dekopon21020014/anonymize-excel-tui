@@ -38,47 +38,6 @@ type ExcelFile struct {
 	*excelize.File
 }
 
-func (xf *ExcelFile) anonymize() {
-	// すべてのシートを取得
-	sheets := xf.GetSheetList()
-	if len(sheets) == 0 {
-		log.Println("No sheets found in the Excel file.")
-		return
-	}
-
-	for _, sheetName := range sheets {
-		// 行を取得
-		rows, err := xf.Rows(sheetName)
-		if err != nil {
-			log.Println("Error reading rows from sheet:", sheetName, err)
-			continue
-		}
-		defer rows.Close() // メモリ解放
-
-		i := 0
-		for rows.Next() {
-			row, err := rows.Columns()
-			if err != nil {
-				log.Println("Error reading row:", err)
-				continue
-			}
-
-			if len(row) < 2 {
-				i++
-				continue
-			}
-
-			patientID := row[1]
-			hashedID := sha256Hash(patientID, password)
-			// xf.SetCellValue(sheetName, fmt.Sprintf("B%d", i+1), hashedID)
-			rowData := []interface{}{row[0], hashedID, "", "", row[4], formatDate(row[5]), row[6]}
-			xf.SetSheetRow(sheetName, fmt.Sprintf("A%d", i+1), &rowData)
-
-			i++
-		}
-	}
-}
-
 func (xf *ExcelFile) anonymizeStreaming(outputDir string) error {
 	// すべてのシートを取得
 	sheets := xf.GetSheetList()
@@ -210,7 +169,9 @@ func main() {
 	setupLogger()
 
 	for { // ユーザが"終了"を選択するまでループ
-		saveDir = filepath.Join(os.Getenv("ANNONYMIZED_DATA_DIR"), time.Now().Format("2006-01-02-150405"))
+		jst := time.FixedZone("UTC+9", 9*60*60)
+		now := time.Now().In(jst)
+		saveDir = filepath.Join(os.Getenv("ANNONYMIZED_DATA_DIR"), now.Format("2006-01-02-150405"))
 
 		initializeTUI()
 		wg = sync.WaitGroup{}
