@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AnonymizeCSV
+Exec=gnome-terminal -- bash -c "docker run -it --rm -v ~:/mnt -v ~/デスクトップ/logs:/logs -v ~/デスクトップ/anonymized-data:/anonymized-data anonymize-csv:amd64"
+Icon=utilities-terminal
+Terminal=false
