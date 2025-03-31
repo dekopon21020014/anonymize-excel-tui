@@ -132,7 +132,7 @@ func writeBuffer(xf *excelize.File, sheetName string, processedRows [][]string) 
 			}
 			cellRef := fmt.Sprintf("%s%d", colLetter, i+1)
 			if err := xf.SetCellValue(sheetName, cellRef, val); err != nil {
-				log.Printf("犯人は毛利小五郎")
+				log.Print("Error setting cell value:", err)
 				return err
 			}
 		}
@@ -313,7 +313,6 @@ func anonymizeExcel(selectedExcel string) {
 		log.Println("Error Stringming:", err)
 		return
 	}
-	log.Println("=========================:", saveDir)
 
 	// 保存フォルダが存在しない場合は作成
 	if _, err := os.Stat(saveDir); os.IsNotExist(err) {
@@ -322,13 +321,6 @@ func anonymizeExcel(selectedExcel string) {
 			log.Fatalf("保存フォルダの作成に失敗: %v", err)
 		}
 	}
-
-	// // 保存
-	// outputPath := filepath.Join(saveDir, "anonymizedData.xlsx")
-	// if err := excel.SaveAs(outputPath); err != nil {
-	// 	log.Println("Error saving file:", err)
-	// 	return
-	// }
 
 	log.Println("Anonymized file saved to:", saveDir)
 	showCompletionMenu()
