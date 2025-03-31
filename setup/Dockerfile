@@ -22,7 +22,7 @@ COPY table table
 RUN go mod tidy
 
 # アプリのビルド
-RUN go build -o anonymize-excel
+RUN go build -o anonymize-csv
 
 # # エントリーポイント
-CMD ["./anonymize-excel"]
+CMD ["./anonymize-csv"]
