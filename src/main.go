@@ -193,7 +193,7 @@ func sha256Hash(patientID, password string) string {
 
 // **日付のフォーマット関数** (変更なし)
 func formatDate(dateStr string) string {
-	parsedTime, err := time.Parse("01-02-06", dateStr)
+	parsedTime, err := time.Parse("2006/1/2", dateStr)
 	if err != nil {
 		log.Println("日付をパースできませんでした: ", dateStr)
 		return "" // 変換できない場合は消す
