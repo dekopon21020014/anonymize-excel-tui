@@ -2,9 +2,13 @@ package main
 
 import (
 	"anonymize-excel-tui/table"
+	"bufio"
+	"bytes"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,9 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
+
 	"github.com/joho/godotenv"
 	"github.com/rivo/tview"
-	"github.com/xuri/excelize/v2"
 )
 
 var (
@@ -25,168 +31,167 @@ var (
 	password      string
 	saveDir       string
 	currentDir    string
-	selectedExel  string
+	selectedCSV   string
 	patientsTable *table.PatientsTable
 
 	// 各種UI
 	passwordForm *tview.Form
-	excelList    *tview.List
+	csvList      *tview.List
 	logView      *tview.TextView
 )
 
-type ExcelFile struct {
-	*excelize.File
+// Shift_JIS か UTF-8 かを判定する関数
+func detectEncoding(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	buf, err := reader.Peek(512) // 最初の512バイトを取得
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+
+	// UTF-8 の判定
+	if bytes.Contains(buf, []byte{0xEF, 0xBB, 0xBF}) || isUTF8(buf) {
+		return "UTF-8", nil
+	}
+
+	// Shift_JIS の判定
+	if isShiftJIS(buf) {
+		return "Shift_JIS", nil
+	}
+
+	return "Unknown", nil
 }
 
-func (xf *ExcelFile) anonymize() {
-	// すべてのシートを取得
-	sheets := xf.GetSheetList()
-	if len(sheets) == 0 {
-		log.Println("No sheets found in the Excel file.")
+// UTF-8 のバイトシーケンスをチェック
+func isUTF8(data []byte) bool {
+	return bytes.Contains(data, []byte{0xC2}) || bytes.Contains(data, []byte{0xE3})
+}
+
+// Shift_JIS のバイトシーケンスをチェック
+func isShiftJIS(data []byte) bool {
+	decoder := japanese.ShiftJIS.NewDecoder()
+	_, _, err := transform.String(decoder, string(data))
+	return err == nil
+}
+
+func anonymizeCSV(selectedCSV string) {
+	log.Println("Processing CSV:", selectedCSV)
+
+	// 保存用フォルダを作成
+	log.Println("保存用フォルダを作成:", saveDir)
+	if err := os.MkdirAll(saveDir, 0755); err != nil {
+		log.Fatalf("保存フォルダの作成に失敗: %v", err)
 		return
 	}
 
-	for _, sheetName := range sheets {
-		// 行を取得
-		rows, err := xf.Rows(sheetName)
+	// 入力ファイルを開く
+	log.Println("Opening file:", selectedCSV)
+	inputFile, err := os.Open(selectedCSV)
+	if err != nil {
+		log.Println("Error opening input file:", err)
+		return
+	}
+	defer inputFile.Close()
+
+	encodingType, err := detectEncoding(selectedCSV)
+	if err != nil {
+		log.Println("Error detecting encoding:", err)
+		return
+	}
+
+	// 出力用のCSVファイルを作成
+	outputPath := filepath.Join(saveDir, sanitizeFileName(filepath.Base(selectedCSV)))
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		log.Println("Error creating output file:", err)
+		return
+	}
+	defer outputFile.Close()
+
+	// CSVリーダーを文字コードに合わせて作成
+	var reader *csv.Reader
+	if encodingType == "UTF-8" {
+		reader = csv.NewReader(inputFile)
+	} else {
+		reader = csv.NewReader(transform.NewReader(inputFile, japanese.ShiftJIS.NewDecoder()))
+	}
+
+	// CSVライターを作成
+	writer := csv.NewWriter(outputFile)
+	defer writer.Flush()
+
+	// ヘッダーを読み取り
+	header, err := reader.Read()
+	if err != nil {
+		log.Println("Error reading header:", err)
+		return
+	}
+
+	// ヘッダーを書き出す
+	if err := writer.Write(header); err != nil {
+		log.Println("Error writing header:", err)
+		return
+	}
+
+	// 行数カウンター
+	rowCount := 1
+
+	// 一行ずつ処理
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
-			log.Println("Error reading rows from sheet:", sheetName, err)
-			continue
-		}
-		defer rows.Close() // メモリ解放
-
-		i := 0
-		for rows.Next() {
-			row, err := rows.Columns()
-			if err != nil {
-				log.Println("Error reading row:", err)
-				continue
-			}
-
-			if len(row) < 2 {
-				i++
-				continue
-			}
-
-			patientID := row[1]
-			hashedID := sha256Hash(patientID, password)
-			// xf.SetCellValue(sheetName, fmt.Sprintf("B%d", i+1), hashedID)
-			rowData := []interface{}{row[0], hashedID, "", "", row[4], formatDate(row[5]), row[6]}
-			xf.SetSheetRow(sheetName, fmt.Sprintf("A%d", i+1), &rowData)
-
-			i++
-		}
-	}
-}
-
-func (xf *ExcelFile) anonymizeStreaming(outputDir string) error {
-	// すべてのシートを取得
-	sheets := xf.GetSheetList()
-	if len(sheets) == 0 {
-		return fmt.Errorf("no sheets found in the Excel file")
-	}
-
-	for _, sheetName := range sheets {
-		// 出力用のExcelファイルを新規作成
-		newFile := excelize.NewFile()
-		newSheetIndex, err := newFile.NewSheet(sheetName) // シートを作成anonymizeStreaming
-		if err != nil {                                   // シート作成失敗
-			log.Println("Error creating new sheet:", err)
-			continue
-		}
-		newFile.SetActiveSheet(newSheetIndex) // 作成したシートをアクティブにする
-
-		// 行を取得（ストリーミング）
-		rows, err := xf.Rows(sheetName)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		// バッファサイズ設定
-		bufferSize := 1000
-		rowCount := 0
-		var processedRows [][]string
-
-		for rows.Next() {
-			row, err := rows.Columns()
-			if err != nil {
-				return err
-			}
-
-			if len(row) < 2 {
-				processedRows = append(processedRows, row)
-				rowCount++
-				continue
-			}
-
-			patientID := row[1]
-			hashedID := sha256Hash(patientID, password)
-			// 行を加工
-			var additionalCols []string
-			for _, col := range row[6:] {
-				additionalCols = append(additionalCols, fmt.Sprintf("%v", col)) // 文字列に変換
-			}
-			processedRow := append([]string{row[0], hashedID, "", "", row[4], formatDate(row[5])}, additionalCols...)
-			processedRows = append(processedRows, processedRow)
-			rowCount++
-
-			// バッファがいっぱいになったら書き戻す
-			if rowCount%bufferSize == 0 {
-				if err := writeBuffer(newFile, sheetName, processedRows); err != nil {
-					return err
-				}
-				processedRows = nil // メモリ開放
-			}
+			log.Println("Error reading CSV row:", err)
+			return
 		}
 
-		// 残りの行を書き戻す
-		if len(processedRows) > 0 {
-			if err := writeBuffer(newFile, sheetName, processedRows); err != nil {
-				return err
-			}
+		// データ行の処理
+		if len(row) >= 10 { // 最低限必要な列数を確認
+			// 患者IDをハッシュ化
+			row[1] = sha256Hash(row[1], password)
+
+			// 個人情報を空白に
+			row[2] = ""                 // 患者名(半角カナ)
+			row[3] = ""                 // 患者名
+			row[5] = formatDate(row[5]) // 生年月日をYYYY/MMに変換
+			row[8] = ""                 // 所属
+			row[9] = ""                 // 保険番号
+			row[10] = ""                // 受診日
 		}
 
-		// シート名を元にファイルを保存
-		outputPath := filepath.Join(outputDir, fmt.Sprintf("%s.xlsx", sanitizeFileName(sheetName)))
-		// **出力先ディレクトリを作成**
-		if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
-			return fmt.Errorf("failed to create output directory: %w", err)
-		}
-		// **ファイルを保存**
-		if err := newFile.SaveAs(outputPath); err != nil {
-			return err
+		// 処理した行を書き出す
+		if err := writer.Write(row); err != nil {
+			log.Println("Error writing processed row:", err)
+			return
 		}
 
-		log.Printf("Processed sheet %s: %d rows -> Saved to %s", sheetName, rowCount, outputPath)
-	}
-	return nil
-}
+		rowCount++
 
-// **バッファのデータを書き戻す関数**
-func writeBuffer(xf *excelize.File, sheetName string, processedRows [][]string) error {
-	for i, processedRow := range processedRows {
-		for j, val := range processedRow {
-			colLetter := string(rune('A' + (j % 26))) // A~Z でループするように
-			if j >= 26 {
-				colLetter = fmt.Sprintf("%c%c", 'A'+(j/26)-1, 'A'+(j%26)) // 2桁カラム対応
-			}
-			cellRef := fmt.Sprintf("%s%d", colLetter, i+1)
-			if err := xf.SetCellValue(sheetName, cellRef, val); err != nil {
-				log.Printf("犯人は毛利小五郎")
-				return err
-			}
+		// 進捗ログ（1000行ごと）
+		if rowCount%1000 == 0 {
+			log.Printf("Processed %d rows...", rowCount)
 		}
 	}
-	return nil
+
+	log.Printf("Anonymization complete. Total rows processed: %d", rowCount)
+	log.Println("Anonymized file saved to:", outputPath)
+	showCompletionMenu()
 }
 
-// **ファイル名に使えない文字を置換**
-func sanitizeFileName(name string) string {
-	re := regexp.MustCompile(`[<>:"/\\|?*]`)
-	return re.ReplaceAllString(name, "_")
+// **SHA256 ハッシュ関数** (変更なし)
+func sha256Hash(patientID, password string) string {
+	hash := sha256.Sum256([]byte(patientID + password))
+	return hex.EncodeToString(hash[:])
 }
 
+// **日付のフォーマット関数** (変更なし)
 func formatDate(dateStr string) string {
 	parsedTime, err := time.Parse("01-02-06", dateStr)
 	if err != nil {
@@ -194,6 +199,58 @@ func formatDate(dateStr string) string {
 		return "" // 変換できない場合は消す
 	}
 	return parsedTime.Format("2006/01")
+}
+
+// **ファイル名に使えない文字を置換** (変更なし)
+func sanitizeFileName(name string) string {
+	re := regexp.MustCompile(`[<>:"/\\|?*]`)
+	return re.ReplaceAllString(name, "_")
+}
+
+// ** excelリストを更新 → CSVリストを更新 **
+func updateCSVList() {
+	go func() { // 非同期で処理
+		csvList.Clear()
+
+		entries, err := os.ReadDir(currentDir)
+		if err != nil {
+			logView.SetText("ディレクトリ読み取り失敗: " + err.Error())
+			return
+		}
+		for _, entry := range entries {
+			filePath := filepath.Join(currentDir, entry.Name())
+
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				csvList.AddItem("[DIR] "+entry.Name(), "", 0, func() {
+					currentDir = filePath
+					updateCSVList()
+				})
+			} else if strings.HasSuffix(strings.ToLower(entry.Name()), ".csv") {
+				csvList.AddItem(entry.Name(), "", 0, func() {
+					selectedCSV = filePath
+					anonymizeCSV(selectedCSV)
+				})
+			}
+		}
+
+		// 親ディレクトリ (..) を追加
+		parentDir := filepath.Dir(currentDir)
+		csvList.AddItem("[DIR] 前のフォルダに戻る", "", 0, func() {
+			currentDir = parentDir
+			updateCSVList()
+		})
+
+		// 画面を更新 & フォーカス移動
+		app.SetFocus(csvList)
+		app.Draw()
+	}()
+}
+
+// ** CSVリストを作成 **
+func createCSVList() *tview.List {
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle("2. 健診データ(.csv)を選択")
+	return list
 }
 
 // ** メイン関数 **
@@ -210,7 +267,12 @@ func main() {
 	setupLogger()
 
 	for { // ユーザが"終了"を選択するまでループ
-		saveDir = filepath.Join(os.Getenv("ANNONYMIZED_DATA_DIR"), time.Now().Format("2006-01-02-150405"))
+		// UTC+9の固定タイムゾーン
+		jst := time.FixedZone("UTC+9", 9*60*60)
+
+		// 現在の時刻を取得して UTC+9 に変換
+		now := time.Now().In(jst)
+		saveDir = filepath.Join(os.Getenv("ANNONYMIZED_DATA_DIR"), now.Format("2006-01-02-150405"))
 
 		initializeTUI()
 		wg = sync.WaitGroup{}
@@ -221,48 +283,25 @@ func main() {
 	}
 }
 
-// ** ログ設定 **
-func setupLogger() {
-	// 保存フォルダが存在しない場合は作成
-	logFileDir := os.Getenv("LOG_FILE_DIR")
-	if _, err := os.Stat(logFileDir); os.IsNotExist(err) {
-		err := os.MkdirAll(logFileDir, 0755) // フォルダ作成
-		if err != nil {
-			log.Fatalf("保存フォルダの作成に失敗: %v", err)
-		}
-	}
-
-	logFile, err := os.OpenFile(
-		filepath.Join(logFileDir, os.Getenv("LOG_FILE_NAME")),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0666,
-	)
-	if err != nil {
-		log.Fatalf("ログファイル作成失敗: %v", err)
-	}
-	log.SetOutput(logFile)
-}
-
 // ** TUIの初期化 **
 func initializeTUI() {
 	app = tview.NewApplication()
-	// currentDir, _ = os.Getwd()
 	currentDir = os.Getenv("CURRENT_DIR")
 
 	// 各画面を作成
 	passwordForm = createPasswordForm()
-	excelList = createExelList()
+	csvList = createCSVList()
 	logView = createLogView()
 
-	// **最初はパスワード画面を表示**
+	// 最初はパスワード画面を表示
 	layout = tview.NewFlex().
 		AddItem(passwordForm, 0, 1, true).
-		AddItem(excelList, 0, 1, false)
+		AddItem(csvList, 0, 1, false)
 
 	app.SetRoot(layout, true)
 }
 
-// ** パスワード入力フォーム **
+// ** パスワード入力フォーム ** (変更なし)
 func createPasswordForm() *tview.Form {
 	form := tview.NewForm()
 	if password == "" { // 初回のみパスワード入力を要求
@@ -274,7 +313,7 @@ func createPasswordForm() *tview.Form {
 	}
 
 	form.AddButton("次へ", func() {
-		updateExcelList()
+		updateCSVList()
 	}).
 		AddButton("終了", func() {
 			app.Stop()
@@ -285,103 +324,16 @@ func createPasswordForm() *tview.Form {
 	return form
 }
 
-func createExelList() *tview.List {
-	list := tview.NewList().ShowSecondaryText(false)
-	list.SetBorder(true).SetTitle("2. 健診データ(.xlsx)を選択")
-	return list
-}
-
-// ** ログ画面 **
+// ** ログ画面 ** (変更なし)
 func createLogView() *tview.TextView {
 	logView := tview.NewTextView().SetDynamicColors(true)
 	logView.SetBorder(true).SetTitle("ログ")
 	return logView
 }
 
-// ** exel選択リストを更新 **
-func updateExcelList() {
-	go func() { // 非同期で処理
-		excelList.Clear()
-
-		entries, err := os.ReadDir(currentDir)
-		if err != nil {
-			logView.SetText("ディレクトリ読み取り失敗: " + err.Error())
-			return
-		}
-		for _, entry := range entries {
-			filePath := filepath.Join(currentDir, entry.Name())
-
-			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-				excelList.AddItem("[DIR] "+entry.Name(), "", 0, func() {
-					currentDir = filePath
-					updateExcelList()
-				})
-			} else if strings.HasSuffix(strings.ToLower(entry.Name()), ".xlsx") {
-				excelList.AddItem(entry.Name(), "", 0, func() {
-					selectedExel = filePath
-					anonymizeExcel(selectedExel)
-				})
-			}
-		}
-
-		// 親ディレクトリ (..) を追加
-		parentDir := filepath.Dir(currentDir)
-		excelList.AddItem("[DIR] 前のフォルダに戻る", "", 0, func() {
-			currentDir = parentDir
-			updateExcelList()
-		})
-
-		// **[追加] 画面を更新 & フォーカス移動**
-		app.SetFocus(excelList)
-		app.Draw()
-	}()
-}
-
-func anonymizeExcel(selectedExcel string) {
-	log.Println("ここで実行されてます:", selectedExcel)
-	// Excelファイルを開く
-	xlFile, err := excelize.OpenFile(selectedExcel)
-	if err != nil {
-		log.Println("Error opening file:", err)
-		return
-	}
-
-	excel := &ExcelFile{xlFile}
-	err = excel.anonymizeStreaming(saveDir)
-	if err != nil {
-		log.Println("Error Stringming:", err)
-		return
-	}
-	log.Println("=========================:", saveDir)
-
-	// 保存フォルダが存在しない場合は作成
-	if _, err := os.Stat(saveDir); os.IsNotExist(err) {
-		err := os.MkdirAll(saveDir, 0755) // フォルダ作成
-		if err != nil {
-			log.Fatalf("保存フォルダの作成に失敗: %v", err)
-		}
-	}
-
-	// // 保存
-	// outputPath := filepath.Join(saveDir, "anonymizedData.xlsx")
-	// if err := excel.SaveAs(outputPath); err != nil {
-	// 	log.Println("Error saving file:", err)
-	// 	return
-	// }
-
-	log.Println("Anonymized file saved to:", saveDir)
-	showCompletionMenu()
-}
-
-// ** SHA256 ハッシュ関数 **
-func sha256Hash(patientID, password string) string {
-	hash := sha256.Sum256([]byte(patientID + password))
-	return hex.EncodeToString(hash[:])
-}
-
-// ** 処理完了メニュー **
+// ** 処理完了メニュー ** (変更なし)
 func showCompletionMenu() {
-	log.Println("complete: ", selectedExel)
+	log.Println("complete: ", selectedCSV)
 	app.Stop()
 	app = tview.NewApplication()
 
@@ -401,4 +353,26 @@ func showCompletionMenu() {
 	if err := app.SetRoot(modal, true).Run(); err != nil {
 		log.Fatalf("アプリケーションエラー: %v", err)
 	}
+}
+
+// ** ログ設定 ** (変更なし)
+func setupLogger() {
+	// 保存フォルダが存在しない場合は作成
+	logFileDir := os.Getenv("LOG_FILE_DIR")
+	if _, err := os.Stat(logFileDir); os.IsNotExist(err) {
+		err := os.MkdirAll(logFileDir, 0755) // フォルダ作成
+		if err != nil {
+			log.Fatalf("保存フォルダの作成に失敗: %v", err)
+		}
+	}
+
+	logFile, err := os.OpenFile(
+		filepath.Join(logFileDir, os.Getenv("LOG_FILE_NAME")),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0666,
+	)
+	if err != nil {
+		log.Fatalf("ログファイル作成失敗: %v", err)
+	}
+	log.SetOutput(logFile)
 }
