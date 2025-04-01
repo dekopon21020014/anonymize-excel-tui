@@ -6,3 +6,4 @@
 .DS_Store
 /anonymized-data
 .vscode
+/logs
